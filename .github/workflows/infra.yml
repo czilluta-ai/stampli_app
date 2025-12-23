@@ -10,7 +10,7 @@ env:
   ECS_CLUSTER: client-ip-cluster
   ECS_SERVICE: client-ip-service
   CONTAINER_NAME: app
-  TF_WORKING_DIR: terraform
+  TF_WORKING_DIR: infrastructure
 
 jobs:
 
