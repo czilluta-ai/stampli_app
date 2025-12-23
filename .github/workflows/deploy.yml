@@ -1,0 +1,94 @@
+name: Deploy to ECS
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+      ECS_TASK_DEFINITION: ${{ secrets.ECS_TASK_DEFINITION }}
+      CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve ECR Repository URI
+        id: ecr
+        run: |
+          set -e
+          REPO_URI=$(aws ecr describe-repositories \
+            --repository-names "$ECR_REPOSITORY" \
+            --query 'repositories[0].repositoryUri' \
+            --output text)
+          echo "REPO_URI=$REPO_URI" >> $GITHUB_OUTPUT
+
+      - name: Build, tag, and push image
+        env:
+          REPO_URI: ${{ steps.ecr.outputs.REPO_URI }}
+        run: |
+          set -e
+          IMAGE_TAG=${GITHUB_SHA}
+          IMAGE_URI=${REPO_URI}:${IMAGE_TAG}
+          echo "Building $IMAGE_URI"
+          docker build -t ${IMAGE_URI} .
+          docker push ${IMAGE_URI}
+          echo "IMAGE_URI=${IMAGE_URI}" >> $GITHUB_OUTPUT
+
+      - name: Prepare new task definition
+        id: taskdef
+        env:
+          IMAGE_URI: ${{ steps.deploy.outputs.IMAGE_URI }}
+        run: |
+          set -e
+          # Fetch current task definition
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_TASK_DEFINITION" \
+            --query 'taskDefinition' > td.json
+
+          # Update the image of the first container definition
+          jq '.containerDefinitions[0].image = env.IMAGE_URI' td.json > td1.json
+
+          # Remove fields not accepted by register-task-definition
+          jq 'del(.revision, .status, .requiresAttributes, .compatibilities, .taskDefinitionArn)' td1.json > td.register.json
+
+          # Register new task definition revision
+          NEW_TD=$(aws ecs register-task-definition --cli-input-json file://td.register.json)
+          NEW_TD_ARN=$(echo "$NEW_TD" | jq -r '.taskDefinition.taskDefinitionArn')
+          echo "NEW_TD_ARN=$NEW_TD_ARN" >> $GITHUB_OUTPUT
+
+      - name: Update ECS service
+        run: |
+          set -e
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "${{ steps.taskdef.outputs.NEW_TD_ARN }}"
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+
+      - name: Invalidate CloudFront cache for root
+        run: |
+          set -e
+          aws cloudfront create-invalidation \
+            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+            --paths "/"
